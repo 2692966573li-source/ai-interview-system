@@ -1,0 +1,13 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+python-dotenv>=1.0,<2
+pydantic>=2.9,<3
+python-multipart>=0.0.12,<1
+PyJWT>=2.9,<3
+langchain-core>=0.3,<1
+langchain-openai>=0.3,<1
+pypdf>=5,<6
+python-docx>=1.1,<2
+reportlab>=4.2,<5
+chromadb>=0.5,<1
+langchain-chroma>=0.1,<1

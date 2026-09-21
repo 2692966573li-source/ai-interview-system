@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+backend/.venv/
+
+# Environment secrets
+.env
+backend/.env
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Runtime data and user files
+data/app.db
+data/uploads/
+data/exports/
+data/chroma_db/
+data/*.db
+backend/data/
+
+# Frontend dependencies/build output
+frontend/node_modules/
+frontend/dist/
+
+# Local scratch files
+tmp/
