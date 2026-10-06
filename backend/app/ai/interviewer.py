@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .model_client import invoke, invoke_with_tools
 from .question_bank import search as question_bank_search
+from .resource_crawler import search_learning_resources
 
 
 SEARCH_QUESTION_BANK_TOOL = {
@@ -23,6 +24,28 @@ SEARCH_QUESTION_BANK_TOOL = {
                 "query": {
                     "type": "string",
                     "description": "检索关键词，例如：Redis 缓存击穿 / 索引优化",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+SEARCH_RESOURCES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_learning_resources",
+        "description": (
+            "根据用户回答暴露的薄弱技术点，抓取外部学习资源（官方文档、教程、问答）。"
+            "当用户明确表达不了解或回答暴露明显知识缺口时调用，"
+            "把资源以『推荐阅读：标题 - 链接』的形式附在问题末尾推送给用户。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词，例如：Redis 缓存穿透 解决方案 / GIL 多线程",
                 }
             },
             "required": ["query"],
@@ -162,15 +185,24 @@ def next_question(
         "action（固定为 ask_question）、question（下一个问题，只能一个问题）、"
         "target_skill（考察技能）、question_id（若使用了题库候选则填其 id，否则为 null）、"
         "reason（为什么这样追问，一句话）。"
+        "如果用户回答暴露明显知识缺口（例如明确说不太了解、没研究过），"
+        "可先调用 search_learning_resources 工具检索学习资源，"
+        "并在 question 末尾用『推荐阅读：标题 - 链接』列出 1-2 条最相关的资源。"
         "不得编造用户简历内容，不得输出评分或多个问题。"
     )
     role = config["target_role"]
     difficulty = config["difficulty"]
 
     def _execute_tool(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
-        if name != "search_question_bank":
-            raise ValueError(f"unknown tool: {name}")
-        return question_bank_search(str(args.get("query", answer)), role, difficulty, limit=4)
+        if name == "search_question_bank":
+            return question_bank_search(str(args.get("query", answer)), role, difficulty, limit=4)
+        if name == "search_learning_resources":
+            try:
+                return search_learning_resources(str(args.get("query", "")))
+            except Exception:
+                # 爬虫失败静默降级：返回空列表让模型基于已有信息继续提问。
+                return []
+        raise ValueError(f"unknown tool: {name}")
 
     messages = [
         SystemMessage(content=system_prompt),
@@ -178,7 +210,7 @@ def next_question(
     ]
     content, tool_calls = invoke_with_tools(
         messages,
-        [SEARCH_QUESTION_BANK_TOOL],
+        [SEARCH_QUESTION_BANK_TOOL, SEARCH_RESOURCES_TOOL],
         _execute_tool,
         caller="interviewer.next_question",
     )

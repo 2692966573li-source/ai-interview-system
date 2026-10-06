@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import ReportCharts from "./components/ReportCharts.vue";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 const activeArea = ref("preparation");
@@ -29,13 +30,18 @@ const isListening = ref(false);
 const voiceStatus = ref("");
 const voiceOutputEnabled = ref(localStorage.getItem("ai_interview_voice_output") === "true");
 const speakingMessageId = ref("");
-// P6 语音进阶：inputEngine=browser|server、outputEngine=browser|server，失败自动降级。
+// P6 语音进阶：inputEngine=browser|server|websocket，失败自动降级。
 const voiceMode = ref(localStorage.getItem("ai_interview_voice_mode") || "browser");
 const voiceOutputMode = ref(localStorage.getItem("ai_interview_voice_output_mode") || "browser");
 const serverTranscribing = ref(false);
+const wsProgressBytes = ref(0);
 let mediaRecorder = null;
 let mediaChunks = [];
 let wsVoice = null;
+let wsRecorder = null;
+let wsStream = null;
+// 赛题三进阶 2：最近一次语音识别得到的音频情绪，随下一次回答一起上送落库。
+let pendingAudioEmotion = null;
 let recognition = null;
 let voiceBaseText = "";
 const form = ref({
@@ -210,6 +216,10 @@ function startListening() {
 }
 
 function stopListening() {
+  if (voiceMode.value === "websocket" && isListening.value) {
+    stopWsVoice();
+    return;
+  }
   if (mediaRecorder && voiceMode.value === "server" && isListening.value) {
     mediaRecorder.stop();
     return;
@@ -221,6 +231,20 @@ function stopListening() {
 
 async function toggleListening() {
   if (isListening.value) { stopListening(); return; }
+  if (voiceMode.value === "websocket") {
+    if (!current.value) return;
+    clearMessage();
+    voiceBaseText = answerText.value.trim();
+    try {
+      await recordViaWs();
+    } catch (err) {
+      isListening.value = false;
+      serverTranscribing.value = false;
+      cleanupWsRecording();
+      voiceStatus.value = "无法使用 WS 实时识别（" + err.message + "），请允许麦克风或改用其他识别方式。";
+    }
+    return;
+  }
   if (voiceMode.value === "server") {
     if (!current.value) return;
     clearMessage();
@@ -323,14 +347,118 @@ async function transcribeViaServer(blob) {
   const body = new FormData();
   body.append("file", new File([blob], "answer.webm", { type: blob.type || "audio/webm" }));
   const data = await request("/sessions/" + current.value.id + "/voice/transcribe", { method: "POST", body });
+  // 赛题三进阶 2：保存音频情绪，随下一次发送回答一起提交。
+  pendingAudioEmotion = data.audio_emotion || null;
+  if (pendingAudioEmotion) {
+    voiceStatus.value = `声音状态：${pendingAudioEmotion.label}（${pendingAudioEmotion.score}）${pendingAudioEmotion.pace || ""}`;
+  }
   return data.text || "";
 }
 
+function cleanupWsRecording() {
+  if (wsRecorder && wsRecorder.state !== "inactive") {
+    try { wsRecorder.stop(); } catch { /* already stopped */ }
+  }
+  wsRecorder = null;
+  if (wsStream) {
+    wsStream.getTracks().forEach((track) => track.stop());
+    wsStream = null;
+  }
+}
+
 function stopWsVoice() {
+  // 停止录音后先发 stop 帧，让服务端触发整体转写；超时兜底直接关闭。
+  if (wsVoice && wsVoice.readyState === WebSocket.OPEN) {
+    try { wsVoice.send(JSON.stringify({ type: "stop", format: "webm" })); } catch { /* closed */ }
+    setTimeout(() => {
+      cleanupWsRecording();
+      if (wsVoice) {
+        try { wsVoice.close(); } catch { /* already closed */ }
+        wsVoice = null;
+      }
+    }, 15000);
+    return;
+  }
+  cleanupWsRecording();
   if (wsVoice) {
     try { wsVoice.close(); } catch { /* already closed */ }
     wsVoice = null;
   }
+}
+
+function recordViaWs() {
+  // 进阶实时语音：录音分片通过 WebSocket 二进制帧推给后端（执行手册 4.2 WS）。
+  return new Promise((resolve, reject) => {
+    if (!token.value) { reject(new Error("请先登录")); return; }
+    const wsBase = API_BASE.replace(/^http/, "ws").replace(/\/api$/, "");
+    const ws = new WebSocket(`${wsBase}/ws/sessions/${current.value.id}`);
+    let ready = false;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ token: token.value, mode: "transcribe" }));
+    };
+    ws.onmessage = (event) => {
+      let payload;
+      try { payload = JSON.parse(event.data); } catch { return; }
+      if (payload.type === "ready") {
+        ready = true;
+        navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+          wsStream = stream;
+          wsRecorder = new MediaRecorder(stream);
+          wsProgressBytes.value = 0;
+          wsRecorder.ondataavailable = (e) => {
+            if (e.data.size && wsVoice && wsVoice.readyState === WebSocket.OPEN) {
+              wsVoice.send(e.data);
+              wsProgressBytes.value += e.data.size;
+            }
+          };
+          wsRecorder.start(300);
+          isListening.value = true;
+          serverTranscribing.value = true;
+          voiceStatus.value = "WS 实时识别中，再次点击结束录音。";
+          resolve();
+        }).catch((err) => {
+          try { ws.close(); } catch { /* already closed */ }
+          reject(err);
+        });
+        return;
+      }
+      if (payload.type === "progress") {
+        voiceStatus.value = `已上传 ${(payload.received / 1024).toFixed(0)} KB…`;
+        return;
+      }
+      if (payload.type === "transcript") {
+        isListening.value = false;
+        serverTranscribing.value = false;
+        cleanupWsRecording();
+        if (payload.text && payload.text !== "无人声") {
+          answerText.value = [voiceBaseText, payload.text].filter(Boolean).join(" ").trim();
+          voiceStatus.value = "WS 实时识别完成，可继续编辑。";
+        } else {
+          voiceStatus.value = payload.text === "无人声" ? "没有听到人声，请再试一次。" : "识别结果为空，请重试。";
+        }
+        try { ws.close(); } catch { /* already closed */ }
+        return;
+      }
+      if (payload.type === "error") {
+        isListening.value = false;
+        serverTranscribing.value = false;
+        cleanupWsRecording();
+        voiceStatus.value = "WS 识别失败：" + payload.message + "，可改用文字输入。";
+        try { ws.close(); } catch { /* already closed */ }
+      }
+    };
+    ws.onerror = () => {
+      if (!ready) reject(new Error("连接失败"));
+      isListening.value = false;
+      serverTranscribing.value = false;
+      cleanupWsRecording();
+    };
+    ws.onclose = () => {
+      cleanupWsRecording();
+      if (wsVoice === ws) wsVoice = null;
+    };
+    wsVoice = ws;
+  });
 }
 
 async function recordViaServer() {
@@ -533,9 +661,13 @@ async function sendAnswer() {
   try {
     const result = await request("/sessions/" + current.value.id + "/messages", {
       method: "POST",
-      body: JSON.stringify({ content: answerText.value.trim() }),
+      body: JSON.stringify({
+        content: answerText.value.trim(),
+        audio_emotion: pendingAudioEmotion,
+      }),
     });
     answerText.value = "";
+    pendingAudioEmotion = null;
     current.value = await request("/sessions/" + current.value.id);
     if (result.termination.can_end_now) {
       stopSpeaking();
@@ -768,7 +900,7 @@ onBeforeUnmount(() => {
                 <div v-for="item in currentMessages" :key="item.id" class="message" :class="item.role"><div class="avatar">{{ item.role === "assistant" ? "AI" : "我" }}</div><div class="message-content"><small>{{ item.role === "assistant" ? "AI 面试官" : "你的回答" }}<span v-if="item.role === 'user' && item.metadata?.emotion" class="emotion-badge" :style="{ background: emotionColor(item.metadata.emotion.score) }">{{ emotionBadge(item.metadata.emotion) }}</span></small><p>{{ item.content }}</p><div v-if="item.role === 'assistant' && (item.metadata?.target_skill || item.question_id)" class="question-meta"><span v-if="item.metadata?.target_skill" class="meta-tag">考察：{{ item.metadata.target_skill }}</span><span v-if="item.question_id" class="meta-tag citation">题库引用：{{ item.question_id }}</span></div><div v-if="item.role === 'assistant' && item.citations?.length" class="citations-box"><small>参考题库候选：</small><span v-for="c in item.citations" :key="c.question_id" class="meta-tag citation">{{ c.question_id }}（{{ c.source === 'chroma_vector' ? '向量' : '关键词' }}）</span></div><button v-if="item.role === 'assistant' && (voiceOutputSupported || voiceOutputMode === 'server')" type="button" class="message-voice-button" @click="toggleSpeech(item)">{{ speakingMessageId ? "停止朗读" : "朗读这条" }}</button></div></div>
               </div>
               <div v-if="endRecommended && isActive" class="notice warn">面试官建议可以结束本次面试，但你仍可以继续回答。</div>
-              <div v-if="isActive" class="answer-box"><div class="voice-input-toolbar"><button type="button" class="outline-button voice-button" :class="{ recording: isListening }" :disabled="loading || (!voiceInputSupported && voiceMode === 'browser')" @click="toggleListening">{{ isListening ? (serverTranscribing ? "识别中…" : "停止语音输入") : "语音输入" }}</button><select v-model="voiceMode" class="voice-mode-select" @change="handleVoiceModeChange"><option value="browser">浏览器识别</option><option value="server">服务端识别</option></select><span>{{ voiceStatus || (voiceMode === 'server' ? "服务端识别：录音结束后由 AI 转成文字" : "可选：点击按钮，用中文直接回答") }}</span></div><textarea v-model="answerText" rows="4" placeholder="输入你的回答。试着说出技术选择、具体数字和你亲自负责的部分。" @keydown.ctrl.enter="sendAnswer"></textarea><div class="answer-actions"><span>Ctrl + Enter 发送</span><button class="primary-button small" :disabled="loading || !answerText.trim()" @click="sendAnswer">发送回答</button></div></div>
+              <div v-if="isActive" class="answer-box"><div class="voice-input-toolbar"><button type="button" class="outline-button voice-button" :class="{ recording: isListening }" :disabled="loading || (!voiceInputSupported && voiceMode === 'browser')" @click="toggleListening">{{ isListening ? (serverTranscribing ? "识别中…" : "停止语音输入") : "语音输入" }}</button><select v-model="voiceMode" class="voice-mode-select" @change="handleVoiceModeChange"><option value="browser">浏览器识别</option><option value="server">服务端识别</option><option value="websocket">WS 实时识别</option></select><span>{{ voiceStatus || (voiceMode === 'server' ? "服务端识别：录音结束后由 AI 转成文字" : voiceMode === 'websocket' ? "WS 实时识别：音频流实时传给后端" : "可选：点击按钮，用中文直接回答") }}</span></div><textarea v-model="answerText" rows="4" placeholder="输入你的回答。试着说出技术选择、具体数字和你亲自负责的部分。" @keydown.ctrl.enter="sendAnswer"></textarea><div class="answer-actions"><span>Ctrl + Enter 发送</span><button class="primary-button small" :disabled="loading || !answerText.trim()" @click="sendAnswer">发送回答</button></div></div>
               <div v-else class="finished-bar">本次面试已结束。<button class="text-button" @click="activeArea = 'growth'">查看评估 →</button></div>
             </div>
             <div class="interview-bottom"><div class="memory-card"><div class="mini-title">记忆管家</div><p>摘要版本 {{ current.memory?.version || 0 }} · 已覆盖到第 {{ current.memory?.covered_turn || 0 }} 轮</p><small>{{ current.memory?.next_focus || "完成五轮后自动生成结构化摘要" }}</small></div><button v-if="isActive" class="outline-button danger" :disabled="loading" @click="endSession">结束面试</button></div>
@@ -788,6 +920,7 @@ onBeforeUnmount(() => {
               <div class="report-panel"><h3>还可以更好</h3><p v-for="item in report.problems" :key="item">{{ item }}</p><div class="evidence-note">报告版本 {{ report.version }} · 已引用 {{ report.meta?.answer_count || 0 }} 条回答</div></div>
               <div v-if="report.emotion?.timeline?.length" class="report-panel emotion-card"><h3>情绪辅助分析</h3><p class="emotion-summary">平均 {{ report.emotion.average_score }} 分 · 主导状态「{{ report.emotion.dominant_label }}」· 趋势：{{ report.emotion.trend }}</p><svg v-if="emotionTrendPoints" class="emotion-chart" viewBox="0 0 260 150" role="img" aria-label="情绪轨迹图"><line v-for="y in [25, 50, 75, 100]" :key="y" x1="20" :y1="120 - y * 0.95" x2="240" :y2="120 - y * 0.95" class="emotion-grid" /><polyline :points="emotionTrendPoints" class="emotion-line" /><circle v-for="(item, index) in report.emotion.timeline" :key="item.turn" :cx="20 + index * (220 / (report.emotion.timeline.length - 1))" :cy="120 - (item.score / 100) * 95" r="3.5" :fill="emotionColor(item.score)" /><text v-for="(item, index) in report.emotion.timeline" :key="'t' + item.turn" :x="20 + index * (220 / (report.emotion.timeline.length - 1))" y="140" class="emotion-axis-label">{{ item.turn }}</text></svg><div class="emotion-turns"><span v-for="item in report.emotion.timeline" :key="'b' + item.turn" class="emotion-turn-chip" :style="{ borderColor: emotionColor(item.score) }">第{{ item.turn }}轮 {{ item.label }} {{ item.score }}</span></div><small class="evidence-note">情绪分来自回答文本的确定性信号（自信表述、不确定词、量化数据），仅供复盘参考。</small></div>
               <div v-if="graphView" class="report-panel graph-card"><h3>知识图谱</h3><p class="emotion-summary">本次回答覆盖 {{ graphView.nodes.length }} 个技能点<template v-if="graphView.meta.covered_focus?.length">，重点已覆盖：{{ graphView.meta.covered_focus.join("、") }}</template><template v-if="graphView.meta.missing_focus?.length">；重点未谈到：{{ graphView.meta.missing_focus.join("、") }}</template></p><svg class="graph-chart" viewBox="0 0 320 220" role="img" aria-label="技能知识图谱"><line v-for="(edge, index) in graphView.edges" :key="'e' + index" :x1="edge.x1" :y1="edge.y1" :x2="edge.x2" :y2="edge.y2" class="graph-edge" :style="{ opacity: Math.min(0.7, 0.25 + edge.weight * 0.15) }" /><circle v-for="node in graphView.nodes" :key="node.id" :cx="node.x" :cy="node.y" :r="node.r" :class="['graph-node', { focus: node.category === '重点' }]" ><title>{{ node.label }} · {{ node.category }} · 提及 {{ node.mentions }} 次（第 {{ node.turns.join('、') }} 轮）</title></circle><text v-for="node in graphView.nodes" :key="'l' + node.id" :x="node.x" :y="node.y - node.r - 4" class="graph-label">{{ node.label }}</text></svg><small class="evidence-note">节点大小 = 提及次数，连线 = 同一回答中共同出现；悬停节点可查看证据轮次。</small></div>
+              <div v-if="report" class="report-panel echarts-panel"><h3>可视化看板（ECharts）</h3><ReportCharts :report="report" /><small class="evidence-note">雷达图、STAR 热力图、情绪时序图与技术栈气泡图均由 ECharts 渲染，支持缩放与悬停查看数据。</small></div>
             </div>
           </template>
         </section>

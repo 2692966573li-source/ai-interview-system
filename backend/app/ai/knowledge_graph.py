@@ -96,3 +96,79 @@ def build_graph(messages: list[dict[str, Any]], focus_skills: list[str] | None =
         "missing_focus": missing_focus,
         "answer_count": len(answer_terms),
     }
+
+
+def build_graph_v2(
+    messages: list[dict[str, Any]],
+    focus_skills: list[str] | None = None,
+    target_role: str = "",
+    retrievals: list[dict[str, Any]] | None = None,
+    question_lookup: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """进阶知识图谱（赛题三进阶 4）：岗位—技能—面试题三层多关系网络。
+
+    在技能共现图基础上新增：
+    - 岗位中心节点，向技能连"要求"边；
+    - 面试题节点（来自题库检索记录），向技能连"考察"边。
+    仍以 JSON 结构返回（赛题基础要求），后续可平滑迁移 Neo4j。
+    """
+    base = build_graph(messages, focus_skills)
+    skill_ids = {node["id"] for node in base["nodes"]}
+    # 技能节点统一补 type 字段，与岗位/面试题节点结构一致（前端按 type 着色）。
+    for node in base["nodes"]:
+        node["type"] = "技能"
+    lookup = question_lookup or {}
+
+    role_label = str(target_role or "").strip() or "目标岗位"
+    role_node = {
+        "id": "role::center",
+        "label": role_label,
+        "mentions": 1,
+        "turns": [],
+        "category": "岗位",
+        "type": "岗位",
+    }
+    role_edges = [
+        {"source": "role::center", "target": node["id"], "relation": "要求", "weight": 2}
+        for node in base["nodes"]
+    ]
+
+    question_nodes: dict[str, dict[str, Any]] = {}
+    question_edges: list[dict[str, Any]] = []
+    for record in retrievals or []:
+        question_id = str(record.get("question_id", "")).strip()
+        if not question_id:
+            continue
+        node = question_nodes.setdefault(
+            question_id,
+            {
+                "id": f"q::{question_id}",
+                "label": str(lookup.get(question_id, {}).get("question", question_id))[:24],
+                "mentions": 0,
+                "turns": [],
+                "category": "面试题",
+                "type": "面试题",
+                "similarity": float(record.get("similarity", 0) or 0),
+            },
+        )
+        node["mentions"] += 1
+        turn = int(record.get("turn_no", 0))
+        if turn and turn not in node["turns"]:
+            node["turns"].append(turn)
+        skill = str(lookup.get(question_id, {}).get("skill", "")).strip()
+        if skill and skill in skill_ids:
+            edge = {
+                "source": f"q::{question_id}",
+                "target": skill,
+                "relation": "考察",
+                "weight": 1,
+            }
+            if edge not in question_edges:
+                question_edges.append(edge)
+
+    return {
+        **base,
+        "nodes": [role_node, *base["nodes"], *sorted(question_nodes.values(), key=lambda n: -n["similarity"])[:8]],
+        "edges": [*role_edges, *base["edges"], *question_edges][:40],
+        "graph_version": 2,
+    }

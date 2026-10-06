@@ -128,3 +128,80 @@ def emotion_section(messages: list[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     return aggregate_emotion(timeline)
+
+
+AUDIO_EMOTION_PROMPT = (
+    "你是面试情绪分析专家。分析这段面试回答音频的语音情绪（语速、音量、停顿、语气），"
+    "不要只根据说话内容判断。只返回 JSON，字段为："
+    '{"score": 0到100的整数，越高代表越自信平稳, '
+    '"label": "自信|平稳|偏紧张|明显紧张" 之一, '
+    '"pace": "语速偏快|语速适中|语速偏慢" 之一, '
+    '"tone": "一句话描述语音语气"}'
+)
+
+
+def analyze_audio_emotion(audio_bytes: bytes, audio_format: str = "wav") -> dict[str, Any] | None:
+    """进阶：音频情绪推理（赛题三进阶 2）。
+
+    把音频传给多模态模型，从韵律层面推理情绪得分；失败返回 None，
+    由调用方降级为纯文本情绪分析，不阻塞面试流程。
+    """
+    import base64
+    import json as _json
+    import logging
+
+    from openai import OpenAI
+
+    from ..config import settings
+
+    logger = logging.getLogger("ai_interview.emotion")
+    if not settings.dashscope_api_key or not audio_bytes:
+        return None
+    if len(audio_bytes) > 15 * 1024 * 1024:
+        return None
+    audio_format = (audio_format or "wav").lower().lstrip(".")
+    data_uri = f"data:audio/{audio_format};base64,{base64.b64encode(audio_bytes).decode()}"
+    try:
+        client = OpenAI(
+            api_key=settings.dashscope_api_key,
+            base_url=settings.bailian_base_url,
+            timeout=60,
+            max_retries=0,
+        )
+        completion = client.chat.completions.create(
+            model=settings.voice_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": AUDIO_EMOTION_PROMPT},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": data_uri, "format": audio_format},
+                        },
+                    ],
+                }
+            ],
+            stream=False,
+            extra_body={"modalities": ["text"]},
+        )
+    except Exception as exc:
+        logger.warning("emotion.audio error=%s", type(exc).__name__)
+        return None
+    content = completion.choices[0].message.content
+    if not isinstance(content, str):
+        content = str(content or "")
+    cleaned = content.strip().replace(chr(96) * 3 + "json", "").replace(chr(96) * 3, "").strip()
+    try:
+        parsed = _json.loads(cleaned)
+    except _json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or "score" not in parsed:
+        return None
+    try:
+        parsed["score"] = max(0, min(100, int(parsed["score"])))
+    except (TypeError, ValueError):
+        return None
+    parsed.setdefault("label", "平稳")
+    parsed["source"] = "audio"
+    return parsed

@@ -9,11 +9,12 @@ from pydantic import BaseModel, Field
 
 from .. import db
 from ..auth import create_access_token, get_current_user, hash_password, public_user, verify_password
-from ..ai.emotion import analyze_answer, emotion_section
+from ..ai.emotion import analyze_answer, analyze_audio_emotion, emotion_section
 from ..ai.interviewer import next_question, opening_question
-from ..ai.knowledge_graph import build_graph
+from ..ai.knowledge_graph import build_graph, build_graph_v2
 from ..ai.question_bank import ensure_vector_index, search
 from ..ai.report import generate_report
+from ..ai.report import build_star_matrix
 from ..ai.report_pdf import create_report_pdf
 from ..ai.report_xlsx import create_report_xlsx
 from ..ai.resume_parser import ALLOWED_EXTENSIONS, extract_text, structure_resume
@@ -40,6 +41,8 @@ class SessionCreate(BaseModel):
 
 class AnswerCreate(BaseModel):
     content: str = Field(min_length=1, max_length=10000)
+    # 赛题三进阶 2：前端随回答上送音频情绪（来自语音转写接口），可选。
+    audio_emotion: dict | None = None
 
 
 class EndRequest(BaseModel):
@@ -245,6 +248,11 @@ def answer(
     turn_no = int(session["turn_count"]) + 1
     # 文本情绪辅助分析（执行手册 6.3 进阶）：规则版本地运行，写入消息元数据。
     emotion = analyze_answer(payload.content)
+    if payload.audio_emotion and isinstance(payload.audio_emotion, dict):
+        # 音频情绪（赛题三进阶 2）与文本情绪一起落库，报告里可区分来源。
+        audio_emotion = dict(payload.audio_emotion)
+        audio_emotion["source"] = "audio"
+        emotion["audio"] = audio_emotion
     answer_message = db.add_message(
         session_id, turn_no, "user", payload.content, {"emotion": emotion}
     )
@@ -347,7 +355,9 @@ async def voice_transcribe(
         text = transcribe_audio(audio_bytes, audio_format)
     except VoiceError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"text": text, "format": audio_format}
+    # 赛题三进阶 2：音频情绪推理（失败静默降级，返回 null 时前端只用文本情绪）。
+    audio_emotion = analyze_audio_emotion(audio_bytes, audio_format)
+    return {"text": text, "format": audio_format, "audio_emotion": audio_emotion}
 
 
 @router.post("/sessions/{session_id}/voice/synthesize")
@@ -394,6 +404,9 @@ async def session_voice_socket(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
     try:
         handshake = json.loads(await websocket.receive_text())
+    except (WebSocketDisconnect, json.JSONDecodeError):
+        return
+    try:
         token = str(handshake.get("token", ""))
         user = _user_from_token(token)
         if user is None or db.get_session_for_user(session_id, user["id"]) is None:
@@ -427,6 +440,9 @@ async def session_voice_socket(websocket: WebSocket, session_id: str) -> None:
             chunks: list[bytes] = []
             while True:
                 message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    # 客户端已断开：直接退出，避免再次 receive 抛 RuntimeError 刷错误日志。
+                    return
                 if "bytes" in message and message["bytes"]:
                     chunks.append(message["bytes"])
                     await websocket.send_text(
@@ -496,9 +512,18 @@ def report(
     report_data = generate_report(messages, session)
     # 执行手册 6.3 进阶：情绪辅助分析与知识图谱随报告一起持久化。
     report_data["emotion"] = emotion_section(messages)
-    report_data["knowledge_graph"] = build_graph(
-        messages, db.loads(session.get("focus_skills_json", "[]"), [])
+    # 赛题三进阶 4：岗位—技能—面试题三层知识图谱（检索记录作为面试题节点来源）。
+    retrievals = db.list_retrievals(session_id)
+    lookup = {item["id"]: item for item in question_bank_lookup(retrievals)}
+    report_data["knowledge_graph"] = build_graph_v2(
+        messages,
+        db.loads(session.get("focus_skills_json", "[]"), []),
+        target_role=session["target_role"],
+        retrievals=retrievals,
+        question_lookup=lookup,
     )
+    # 赛题三功能 9：STAR 热力图数据（本地规则计算，随报告持久化）。
+    report_data["star"] = build_star_matrix(messages)
     saved = db.save_report(session_id, report_data)
     _audit(request, current_user, "report.generate", "session", session_id)
     return saved
@@ -511,9 +536,32 @@ def knowledge_graph_endpoint(
     session = db.get_session_for_user(session_id, current_user["id"])
     if session is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return build_graph(
-        db.list_messages(session_id), db.loads(session.get("focus_skills_json", "[]"), [])
+    retrievals = db.list_retrievals(session_id)
+    lookup = {item["id"]: item for item in question_bank_lookup(retrievals)}
+    return build_graph_v2(
+        db.list_messages(session_id),
+        db.loads(session.get("focus_skills_json", "[]"), []),
+        target_role=session["target_role"],
+        retrievals=retrievals,
+        question_lookup=lookup,
     )
+
+
+def question_bank_lookup(retrievals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按检索记录里的题目 ID 批量取题面信息（知识图谱面试题节点标签用）。"""
+    question_ids = sorted({str(item.get("question_id", "")) for item in retrievals} - {""})
+    if not question_ids:
+        return []
+    from ..ai.question_bank import seed as seed_question_bank
+
+    placeholders = ",".join("?" for _ in question_ids)
+    with db.connection() as conn:
+        seed_question_bank(conn)
+        rows = conn.execute(
+            f"SELECT id, question, skill FROM question_bank WHERE id IN ({placeholders})",
+            question_ids,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @router.get("/sessions/{session_id}/report.pdf")

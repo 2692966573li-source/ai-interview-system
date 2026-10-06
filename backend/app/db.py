@@ -583,3 +583,18 @@ def record_retrievals(
                 for item in candidates
             ],
         )
+
+
+def list_retrievals(session_id: str) -> list[dict[str, Any]]:
+    """读取一次面试的全部题库检索记录（知识图谱升级：面试题节点数据来源）。"""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT question_id, turn_no, source, similarity, used_at
+            FROM question_retrievals
+            WHERE session_id = ?
+            ORDER BY turn_no, used_at
+            """,
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]

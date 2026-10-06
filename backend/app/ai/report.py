@@ -8,6 +8,33 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .model_client import invoke
 
 
+# STAR 热力图（赛题三功能 9）：每轮回答在 Situation/Task/Action/Result 四要素上的信号密度。
+STAR_PATTERNS = {
+    "Situation 情境": ("当时", "背景", "场景", "项目里", "业务上", "需求", "原来", "之前"),
+    "Task 任务": ("负责", "任务", "目标", "需要我", "要求", "接手", "承担"),
+    "Action 行动": ("我实现", "我设计", "我优化", "我排查", "采用", "使用", "编写", "推动", "引入", "重构"),
+    "Result 结果": ("结果", "提升", "降低", "%", "收益", "落地", "上线", "达标", "减少", "缩短"),
+}
+
+
+def build_star_matrix(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """生成 STAR 热力图数据：x=回答轮次，y=S/T/A/R，值=该轮回答四要素命中密度(0-1)。"""
+    turns: list[int] = []
+    cells: list[list[float]] = []
+    for item in messages:
+        if item.get("role") != "user" or int(item.get("turn_no", 0)) == 0:
+            continue
+        content = str(item.get("content", ""))
+        turns.append(int(item.get("turn_no", 0)))
+        length = max(len(content), 1)
+        row = len(turns) - 1
+        for column, patterns in enumerate(STAR_PATTERNS.values()):
+            hits = sum(content.count(pattern) for pattern in patterns)
+            density = min(1.0, round(hits * 12 / length * 3, 2))
+            cells.append([row, column, density])
+    return {"turns": turns, "dimensions": list(STAR_PATTERNS.keys()), "cells": cells}
+
+
 def _quote_from_answer(answer: str, requested_quote: Any = "") -> str:
     """Keep the model's short quote when it is real; otherwise derive one safely."""
     answer = str(answer or "").strip()
