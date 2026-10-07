@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from . import model_client
 from .model_client import invoke, invoke_with_tools
 from .question_bank import search as question_bank_search
 from .resource_crawler import search_learning_resources
@@ -90,6 +91,21 @@ def mock_followup(answer: str, excluded_question_ids: list[str] | None = None) -
             "从你刚才的经历中，我想继续追问一个具体细节：当时为什么这样设计？如果重新做一次，你会改哪里？",
             "设计取舍",
         ),
+        (
+            "troubleshooting",
+            "请再挑一个你在这个项目里遇到的最棘手的问题，讲讲当时的排查过程、定位依据和最终解决办法。",
+            "问题排查",
+        ),
+        (
+            "teamwork",
+            "在这个项目里你与其他成员如何分工协作？遇到意见分歧时你是怎么推进的？",
+            "团队协作",
+        ),
+        (
+            "improvement",
+            "如果有机会重做这个项目，你会引入什么新技术或架构改进？预期带来什么收益？",
+            "技术演进",
+        ),
     ]
     if any(token in lowered for token in ("%", "提升", "降低", "速度", "性能")):
         preferred = [candidates[0], candidates[4]]
@@ -101,13 +117,25 @@ def mock_followup(answer: str, excluded_question_ids: list[str] | None = None) -
         preferred = [candidates[3], candidates[4]]
     else:
         preferred = [candidates[4], candidates[1]]
-    chosen = next((item for item in preferred if item[0] not in excluded), candidates[4])
-    if chosen[0] in excluded:
-        chosen = (f"{chosen[0]}-{len(excluded)}", chosen[1], chosen[2])
+    chosen = next((item for item in preferred if item[0] not in excluded), None)
+    if chosen is None:
+        # 兜底候选全部用过：按总追问次数轮换题面并变换问法，保证连续两轮不撞题。
+        fallback = candidates[len(excluded) % len(candidates)]
+        round_no = sum(
+            1 for item in excluded if str(item) == fallback[0] or str(item).startswith(f"{fallback[0]}-r")
+        )
+        angles = ("换个角度，", "再深入一点：", "换个场景，", "补充追问：")
+        chosen = (
+            f"{fallback[0]}-r{round_no}",
+            f"{angles[round_no % len(angles)]}{fallback[1]}",
+            fallback[2],
+        )
     return chosen[1], {
         "action": "ask_question",
         "target_skill": chosen[2],
         "question_id": None,
+        # 本地追问 ID 存进 metadata，供 next_question 去重；不写 question_id 以免误报题库引用。
+        "mock_followup_id": chosen[0],
         "reason": "基于回答关键词的本地规则追问",
     }
 
@@ -155,10 +183,12 @@ def next_question(
     ]
     asked = [item["content"] for item in window if item["role"] == "assistant"]
     # 已问题目 ID 硬去重（执行手册 5.1/5.3）：历史消息与摘要两处合并。
+    # mock 兜底追问的 ID 存在 metadata.mock_followup_id，一并收集，否则兜底路径会重复同一问题。
     asked_ids = {
-        item.get("question_id")
+        item.get("question_id") or item.get("metadata", {}).get("mock_followup_id")
         for item in recent_messages
-        if item.get("role") == "assistant" and item.get("question_id")
+        if item.get("role") == "assistant"
+        and (item.get("question_id") or item.get("metadata", {}).get("mock_followup_id"))
     }
     asked_ids.update(str(item) for item in summary.get("asked_question_ids", []) if item)
     candidate_payload = [
@@ -217,6 +247,11 @@ def next_question(
     if not content:
         # 工具路径失败（模型不支持 Function Call、超时等）时回退到普通调用。
         content = invoke([*messages], caller="interviewer.next_question")
+    if not content and model_client.get_model() is None:
+        # 模型未配置时记录一次提示，方便排查"为什么一直走本地兜底"。
+        model_client.logger.warning(
+            "interviewer.next_question: 模型未配置（缺少 API Key），已降级为本地规则追问"
+        )
     if content:
         parsed = _cleaned_json(content)
         question = None
